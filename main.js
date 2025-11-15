@@ -32,33 +32,40 @@ async function getSystemInfo() {
 
 
 /**
- * Loads an image from a URL and returns its ImageData.
- * Uses OffscreenCanvas if available, with a fallback to a regular canvas.
+ * Loads an image from a URL and returns it as an HTMLImageElement.
  * @param {string} url The URL of the image to load.
- * @returns {Promise<ImageData>} A promise that resolves to the ImageData of the loaded image.
+ * @returns {Promise<HTMLImageElement>} A promise that resolves to the loaded image.
  */
-async function loadImage(url) {
-  return new Promise((resolve, reject) => {
-    const image = new Image();
-    image.crossOrigin = "Anonymous"; // Handle potential CORS issues
-    image.onload = () => {
-      let canvas;
-      // Check for OffscreenCanvas support
-      if (typeof OffscreenCanvas !== 'undefined') {
+async function loadImageElement(url) {
+    return new Promise((resolve, reject) => {
+        const image = new Image();
+        image.crossOrigin = "Anonymous";
+        image.onload = () => resolve(image);
+        image.onerror = reject;
+        image.src = url;
+    });
+}
+
+
+/**
+ * Converts an HTMLImageElement to ImageData.
+ * @param {HTMLImageElement} image The image to convert.
+ * @returns {ImageData} The image data.
+ */
+function imageToImageData(image) {
+    let canvas;
+    if (typeof OffscreenCanvas !== 'undefined') {
         canvas = new OffscreenCanvas(image.width, image.height);
-      } else {
+    } else {
         canvas = document.createElement('canvas');
         canvas.width = image.width;
         canvas.height = image.height;
-      }
-      const ctx = canvas.getContext('2d');
-      ctx.drawImage(image, 0, 0);
-      resolve(ctx.getImageData(0, 0, image.width, image.height));
-    };
-    image.onerror = reject;
-    image.src = url;
-  });
+    }
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(image, 0, 0);
+    return ctx.getImageData(0, 0, image.width, image.height);
 }
+
 
 /**
  * Converts RGB ImageData to a grayscale Float32Array.
@@ -104,12 +111,68 @@ async function runSession(session, inputTensor) {
 
 /**
  * Creates and initializes an ONNX Runtime Inference Session.
+ * @param {string} modelPath The path to the ONNX model.
+ * @param {string} provider The execution provider to use.
  * @returns {Promise<ort.InferenceSession>} A promise that resolves to the created session.
  */
-async function startSession(provider) {
+async function startSession(modelPath, provider) {
     // Create a new session and load the specific model.
-    return await ort.InferenceSession.create('./data/superpoint_1637x2048.onnx', { executionProviders: [provider] });
+    return await ort.InferenceSession.create(modelPath, { executionProviders: [provider] });
 }
+
+/**
+ * Draws the original image and keypoints on the canvas from the model's heatmap output.
+ * @param {HTMLCanvasElement} canvas The canvas to draw on.
+ * @param {HTMLImageElement} image The original image.
+ * @param {ort.Tensor} heatmapTensor The heatmap tensor from the model output (e.g., 'semi').
+ */
+function drawKeypoints(canvas, image, heatmapTensor) {
+    const ctx = canvas.getContext('2d');
+    canvas.width = image.width;
+    canvas.height = image.height;
+    ctx.drawImage(image, 0, 0);
+
+    const data = heatmapTensor.data;
+    const dims = heatmapTensor.dims;
+    const [channelCount, heatmapHeight, heatmapWidth] = [dims[1], dims[2], dims[3]];
+    const confidenceThreshold = 0.015; // This is a crucial parameter to tune.
+
+    // The model outputs a heatmap with 65 channels. The first 64 are for keypoints in an 8x8 grid.
+    // We need to perform a "depth to space" operation to create a full-size heatmap.
+    const fullSizeHeatmap = new Float32Array(image.width * image.height);
+    const cellSize = 8;
+
+    for (let c = 0; c < channelCount - 1; c++) { // Iterate through the 64 keypoint channels
+        const subPixelY = Math.floor(c / cellSize);
+        const subPixelX = c % cellSize;
+
+        for (let y = 0; y < heatmapHeight; y++) {
+            for (let x = 0; x < heatmapWidth; x++) {
+                const heatmapIndex = (c * heatmapHeight * heatmapWidth) + (y * heatmapWidth) + x;
+                const score = data[heatmapIndex];
+
+                const finalX = x * cellSize + subPixelX;
+                const finalY = y * cellSize + subPixelY;
+
+                const fullMapIndex = finalY * image.width + finalX;
+                fullSizeHeatmap[fullMapIndex] = score;
+            }
+        }
+    }
+
+    // Now, iterate through the full-size heatmap and draw points above the threshold.
+    ctx.fillStyle = 'green';
+    for (let i = 0; i < fullSizeHeatmap.length; i++) {
+        if (fullSizeHeatmap[i] > confidenceThreshold) {
+            const x = i % image.width;
+            const y = Math.floor(i / image.width);
+            ctx.beginPath();
+            ctx.arc(x, y, 2, 0, 2 * Math.PI); // Draw a circle of radius 2
+            ctx.fill();
+        }
+    }
+}
+
 
 /**
  * Triggers a download of the provided data as a JSON file.
@@ -133,23 +196,30 @@ a.download = filename;
  */
 async function main() {
     const resultsData = {};
+    const modelPath = './data/superpoint_1637x2048.onnx';
+    const imageUrl = 'data/pinball_1024x1024.jpg';
+
     try {
         resultsData.systemInfo = await getSystemInfo();
+        resultsData.runContext = {
+            model: modelPath.split('/').pop(),
+            image: imageUrl.split('/').pop()
+        };
         resultsData.performance = {};
         const perf = resultsData.performance;
 
         let startTime = performance.now();
         
-        const session = await startSession('wasm');
+        const session = await startSession(modelPath, 'wasm');
         perf.sessionCreation = performance.now() - startTime;
         console.log('ONNX session started successfully.', session);
-
-        const imageUrl = 'data/pinball_1024x1024.jpg';
         
         startTime = performance.now();
-        const imageData = await loadImage(imageUrl);
+        const image = await loadImageElement(imageUrl);
         perf.imageLoading = performance.now() - startTime;
-        console.log('Image loaded successfully.', imageData);
+        console.log('Image loaded successfully.', image);
+
+        const imageData = imageToImageData(image);
 
         startTime = performance.now();
         const grayData = rgb2gray(imageData);
@@ -167,6 +237,13 @@ async function main() {
         console.log('Inference results:', results);
 
         perf.totalTime = Object.values(perf).reduce((a, b) => a + b, 0);
+
+        const canvas = document.getElementById('output-canvas');
+        // The model output is a map with 'semi' and 'desc'. 'semi' is the heatmap.
+        const heatmapTensor = results['semi'];
+        
+        console.log('Heatmap Tensor:', heatmapTensor);
+        drawKeypoints(canvas, image, heatmapTensor);
 
         console.log('Results Data:', resultsData);
         downloadJson(resultsData, `performance_${new Date().toISOString()}.json`);

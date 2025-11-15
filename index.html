@@ -1,9 +1,16 @@
 <!DOCTYPE html>
 <html>
     <head>
-        <title>ONNX Runtime JavaScript examples: Quick Start - Web (using bundler)</title>
+        <title>SuperPoint ONNX Demo</title>
+        <style>
+            body { font-family: sans-serif; }
+            canvas { border: 1px solid black; }
+        </style>
     </head>
     <body>
+        <h1>SuperPoint Feature Detection</h1>
+        <p>The model's output keypoints are drawn in red on the image below.</p>
+        <canvas id="output-canvas"></canvas>
         <!-- consume a single file bundle -->
         <script type="module" src="./dist/bundle.min.js"></script>
     </body>
