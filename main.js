@@ -83,7 +83,7 @@ async function runSession(session, inputTensor) {
  */
 async function startSession(provider) {
     // Create a new session and load the specific model.
-    return await ort.InferenceSession.create('./superpoint_1637x2048.onnx', { executionProviders: [provider] });
+    return await ort.InferenceSession.create('./data/superpoint_1637x2048.onnx', { executionProviders: [provider] });
 }
 
 /**
@@ -96,7 +96,7 @@ async function main() {
 
         // You can now use the session for inference.
         // For example, load an image and run the model:
-        const imageUrl = 'pinball_1024x1024.jpg';
+        const imageUrl = 'data/pinball_1024x1024.jpg';
         const imageData = await loadImage(imageUrl);
         console.log('Image loaded successfully.', imageData);
 
