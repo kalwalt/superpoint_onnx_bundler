@@ -81,9 +81,9 @@ async function runSession(session, inputTensor) {
  * Creates and initializes an ONNX Runtime Inference Session.
  * @returns {Promise<ort.InferenceSession>} A promise that resolves to the created session.
  */
-async function startSession() {
+async function startSession(provider) {
     // Create a new session and load the specific model.
-    return await ort.InferenceSession.create('./superpoint_1637x2048.onnx', { executionProviders: ['wasm'] });
+    return await ort.InferenceSession.create('./superpoint_1637x2048.onnx', { executionProviders: [provider] });
 }
 
 /**
@@ -91,7 +91,7 @@ async function startSession() {
  */
 async function main() {
     try {
-        const session = await startSession();
+        const session = await startSession('wasm');
         console.log('ONNX session started successfully.', session);
 
         // You can now use the session for inference.
