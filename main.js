@@ -5,10 +5,24 @@
 // https://github.com/microsoft/onnxruntime-inference-examples/tree/main/js/importing_onnxruntime-web
 // ES Module import syntax
 import * as ort from 'onnxruntime-web';
+//  Enable SIMD (if supported)
+ort.env.wasm.simd = true;
+// Use proxy worker (required for multithreading)
+ort.env.wasm.proxy = true;
+
+// Number of threads (limit to avoid oversubscription)
+const hw = navigator.hardwareConcurrency || 4;
+ort.env.wasm.numThreads = Math.min(8, hw);
+
 
 /**
- * Gathers system and browser information for performance logging.
- * @returns {Promise<object>} A promise that resolves to an object with system information.
+ * Gather system and browser information for performance logging.
+ * @returns {Promise<Object>} Promise that resolves to an object with possible fields:
+ *  - platform {string}
+ *  - brands {string} (e.g. "Chromium 120, Google Chrome 120")
+ *  - architecture {string}
+ *  - userAgent {string} (fallback)
+ * @throws {Error} If userAgentData.getHighEntropyValues fails.
  */
 async function getSystemInfo() {
     const info = {};
@@ -32,9 +46,11 @@ async function getSystemInfo() {
 
 
 /**
- * Loads an image from a URL and returns it as an HTMLImageElement.
- * @param {string} url The URL of the image to load.
- * @returns {Promise<HTMLImageElement>} A promise that resolves to the loaded image.
+ * Load an image from a URL and return it as an HTMLImageElement.
+ * @param {string} url URL of the image to load.
+ * @returns {Promise<HTMLImageElement>} Promise that resolves to the loaded image element.
+ * @rejects {Event|Error} In case of loading errors.
+ * @notes The image element has `crossOrigin` set to "Anonymous".
  */
 async function loadImageElement(url) {
     return new Promise((resolve, reject) => {
@@ -48,9 +64,11 @@ async function loadImageElement(url) {
 
 
 /**
- * Converts an HTMLImageElement to ImageData.
- * @param {HTMLImageElement} image The image to convert.
- * @returns {ImageData} The image data.
+ * Convert an HTMLImageElement to ImageData.
+ * @param {HTMLImageElement} image Input image element.
+ * @returns {ImageData} Extracted ImageData.
+ * @throws {Error} If 2D context is not available.
+ * @notes Uses OffscreenCanvas when available, otherwise a DOM canvas is created.
  */
 function imageToImageData(image) {
     let canvas;
@@ -68,9 +86,11 @@ function imageToImageData(image) {
 
 
 /**
- * Converts RGB ImageData to a grayscale Float32Array.
- * @param {ImageData} imageData The input image data.
- * @returns {Float32Array} A flat array of grayscale values (normalized to 0-1).
+ * Convert RGB ImageData to a grayscale Float32Array.
+ * @param {ImageData} imageData Source ImageData in RGBA format.
+ * @returns {Float32Array} Flat Float32Array of normalized grayscale values in [0, 1],
+ *                        length = width * height.
+ * @notes Uses luminosity formula: 0.299 * R + 0.587 * G + 0.114 * B.
  */
 function rgb2gray(imageData) {
     const { data, width, height } = imageData;
@@ -87,20 +107,22 @@ function rgb2gray(imageData) {
 }
 
 /**
- * Creates an ONNX tensor from grayscale image data.
- * @param {Float32Array} grayData The grayscale image data.
- * @param {number[]} dims The dimensions of the tensor [batch, channels, height, width].
- * @returns {ort.Tensor} The created tensor.
+ * Create an ONNX tensor from grayscale image data.
+ * @param {Float32Array} grayData Normalized grayscale data.
+ * @param {number[]} dims Tensor dimensions, e.g. [1, 1, height, width].
+ * @returns {ort.Tensor} ONNX tensor (dtype 'float32').
  */
 function defineTensorInput(grayData, dims) {
     return new ort.Tensor('float32', grayData, dims);
 }
 
 /**
- * Runs inference on the ONNX session.
- * @param {ort.InferenceSession} session The ONNX inference session.
- * @param {ort.Tensor} inputTensor The input tensor.
- * @returns {Promise<ort.InferenceSession.OnnxValueMapType>} A promise that resolves to the output of the session.
+ * Run inference on an ONNX session.
+ * @param {ort.InferenceSession} session Initialized ONNX InferenceSession.
+ * @param {ort.Tensor} inputTensor Input tensor.
+ * @returns {Promise<Object<string, ort.Tensor>>} Promise resolving to an output map
+ *                                              (e.g. { semi: ort.Tensor, desc: ort.Tensor }).
+ * @throws {Error} If session.run fails.
  */
 async function runSession(session, inputTensor) {
     const feeds = {};
@@ -110,21 +132,26 @@ async function runSession(session, inputTensor) {
 
 
 /**
- * Creates and initializes an ONNX Runtime Inference Session.
- * @param {string} modelPath The path to the ONNX model.
- * @param {string} provider The execution provider to use.
- * @returns {Promise<ort.InferenceSession>} A promise that resolves to the created session.
+ * Create and initialize an ONNX Runtime Inference Session.
+ * @param {string} modelPath Relative path or URL to the ONNX model file.
+ * @param {string} provider Execution provider name to use (e.g. 'wasm' or 'webgl').
+ * @returns {Promise<ort.InferenceSession>} Promise that resolves to the ready session.
+ * @throws {Error} If model loading or initialization fails.
+ * @notes Passes options: { executionProviders: [provider], graphOptimizationLevel: 'all' }.
  */
 async function startSession(modelPath, provider) {
     // Create a new session and load the specific model.
-    return await ort.InferenceSession.create(modelPath, { executionProviders: [provider] });
+    return await ort.InferenceSession.create(modelPath, { executionProviders: [provider], graphOptimizationLevel: 'all' });
 }
 
 /**
- * Draws the original image and keypoints on the canvas from the model's heatmap output.
- * @param {HTMLCanvasElement} canvas The canvas to draw on.
- * @param {HTMLImageElement} image The original image.
- * @param {ort.Tensor} heatmapTensor The heatmap tensor from the model output (e.g., 'semi').
+ * Draw the original image and keypoints on the canvas from the model's heatmap output.
+ * @param {HTMLCanvasElement} canvas Canvas to draw on.
+ * @param {HTMLImageElement} image Original image (used for size/background).
+ * @param {ort.Tensor} heatmapTensor Output 'semi' tensor from the model. Expect dims [1, C, H, W].
+ * @param {number} [confidenceThreshold=0.015] Confidence threshold for drawing points.
+ * @notes Performs an implicit "depth-to-space" arrangement: assumes the first 64 channels map
+ *        to an 8x8 sub-pixel grid per heatmap cell.
  */
 function drawKeypoints(canvas, image, heatmapTensor) {
     const ctx = canvas.getContext('2d');
@@ -175,9 +202,11 @@ function drawKeypoints(canvas, image, heatmapTensor) {
 
 
 /**
- * Triggers a download of the provided data as a JSON file.
- * @param {object} data The data to be downloaded.
- * @param {string} filename The name of the file to be downloaded.
+ * Trigger download of the provided data as a JSON file.
+ * @param {Object} data Object to serialize as JSON.
+ * @param {string} [filename='performance.json'] File name for the download.
+ * @returns {void}
+ * @notes Uses Blob and URL.createObjectURL and revokes the URL after download.
  */
 function downloadJson(data, filename = 'performance.json') {
     const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
@@ -192,11 +221,15 @@ a.download = filename;
 }
 
 /**
- * The main entry point of the application.
+ * Main entry point of the application.
+ * @returns {Promise<void>} Promise that resolves when the main flow completes.
+ * @throws {Error} Any errors are caught internally and saved into the performance JSON.
+ * @notes Records timings (ms) for: session creation, image loading, grayscale conversion,
+ *        tensor creation and inference. Timings are expressed in milliseconds.
  */
 async function main() {
     const resultsData = {};
-    const modelPath = './data/superpoint_1637x2048.onnx';
+    const modelPath = './data/superpoint_quantized.onnx';
     const imageUrl = 'data/pinball_1024x1024.jpg';
 
     try {
