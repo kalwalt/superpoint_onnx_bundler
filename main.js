@@ -149,7 +149,6 @@ async function startSession(modelPath, provider) {
  * @param {HTMLCanvasElement} canvas Canvas to draw on.
  * @param {HTMLImageElement} image Original image (used for size/background).
  * @param {ort.Tensor} heatmapTensor Output 'semi' tensor from the model. Expect dims [1, C, H, W].
- * @param {number} [confidenceThreshold=0.015] Confidence threshold for drawing points.
  * @notes Performs an implicit "depth-to-space" arrangement: assumes the first 64 channels map
  *        to an 8x8 sub-pixel grid per heatmap cell.
  */
