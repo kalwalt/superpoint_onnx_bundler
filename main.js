@@ -11,7 +11,7 @@ ort.env.wasm.simd = true;
 ort.env.wasm.proxy = true;
 
 // Number of threads (limit to avoid oversubscription)
-const hw = navigator.hardwareConcurrency || 4;
+const hw = (typeof navigator !== 'undefined' && navigator.hardwareConcurrency) || 4;
 ort.env.wasm.numThreads = Math.min(8, hw);
 
 
