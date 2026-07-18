@@ -63,13 +63,24 @@ This opens `http://localhost:5000`.
 
 ## 🧠 ONNX Model Details
 
-The current SuperPoint model used in this project operates with **`float32`** tensors. This provides high precision for the model's calculations.
+The bundled model (`data/superpoint_quantized.onnx`) is **dynamically quantized to `uint8`**, produced by [`superpoint_infer_engine`](https://github.com/kalwalt/superpoint_infer_engine/tree/feature-dynamic_axes)'s `convert_onnx.py` via `onnxruntime.quantization.quantize_dynamic`. Each conv layer is replaced with a `ConvInteger` op, with activations quantized at runtime via `DynamicQuantizeLinear` (no calibration data needed) - see that repo's Readme for the full mechanism.
+
+### Quantized vs float32 benchmark (this runtime)
+
+Measured with a standalone benchmark page (same 1024x1024 input, 2 warm-up + 8 timed `session.run()` calls per model, `onnxruntime-web` WASM backend, SIMD + 8 threads, `crossOriginIsolated: true`):
+
+| | float32 | quantized (dynamic, `ConvInteger`) |
+|---|---|---|
+| Session creation | 442 ms | 101 ms |
+| Inference (mean) | 1794.7 ms | 1474.4 ms |
+| Inference (median) | 1804.3 ms | 1478.9 ms |
+
+Quantization is a real but modest win here: **~18% faster inference**, plus a much faster session load (~4x smaller file: 1.3 MB vs 5.2 MB) - roughly 30% less total time per run including model load. That's well short of the 2-4x speedups int8 quantization gets on runtimes with fully-vectorized integer kernels, which suggests `ConvInteger` in onnxruntime-web's WASM backend gets *some* acceleration but likely not a fully SIMD-optimized path (inferred from the gap, not confirmed against ORT's WASM kernel source). This result is specific to the WASM/browser backend - it doesn't necessarily hold for the OpenVINO/Movidius targets that `superpoint_infer_engine` also produces artifacts for, since those don't consume this quantized graph.
 
 ## 🔮 Future Development
 
 Here are some ideas for future improvements:
 
-- [ ] **Migrate to a `uint8` Quantized ONNX Model**: Converting the model to use 8-bit integers (`uint8`) can significantly reduce its file size and improve inference speed, especially on devices without powerful GPUs. This is a key optimization for web-based ML applications.
 - [ ] **Implement Non-Maximum Suppression (NMS)**: To refine the keypoint detection by removing redundant, overlapping points and keeping only the most confident one in a local area.
 - [ ] **Add a UI for Image Upload**: Allow users to upload their own images for feature detection.
 - [ ] **Visualize Descriptors**: Add a feature to visualize the feature descriptors associated with each keypoint.
