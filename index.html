@@ -9,7 +9,12 @@
     </head>
     <body>
         <h1>SuperPoint Feature Detection</h1>
-        <p>The model's output keypoints are drawn in red on the image below.</p>
+        <p>The model's output keypoints are drawn in green on the image below.</p>
+        <p>
+            <label for="image-upload">Try your own image: </label>
+            <input type="file" id="image-upload" accept="image/*" disabled>
+        </p>
+        <p id="status">Loading default image...</p>
         <canvas id="output-canvas"></canvas>
         <!-- consume a single file bundle -->
         <script type="module" src="./dist/bundle.min.js"></script>
