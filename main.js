@@ -5,12 +5,16 @@
 // https://github.com/microsoft/onnxruntime-inference-examples/tree/main/js/importing_onnxruntime-web
 // ES Module import syntax
 import * as ort from 'onnxruntime-web';
-//  Enable SIMD (if supported)
-ort.env.wasm.simd = true;
+// onnxruntime-web >=1.17 ships a single ort-wasm-simd-threaded.wasm build, so SIMD is
+// always used when the browser supports it - there is no non-SIMD binary to opt into.
+
 // Use proxy worker (required for multithreading)
 ort.env.wasm.proxy = true;
 
-// Number of threads (limit to avoid oversubscription)
+// Number of threads (limit to avoid oversubscription).
+// Actual multithreading only kicks in when the page is cross-origin isolated
+// (COOP/COEP response headers -> SharedArrayBuffer available). If it isn't,
+// ORT silently falls back to 1 thread regardless of this value.
 const hw = (typeof navigator !== 'undefined' && navigator.hardwareConcurrency) || 4;
 ort.env.wasm.numThreads = Math.min(8, hw);
 
@@ -44,6 +48,40 @@ async function getSystemInfo() {
     return info;
 }
 
+
+/**
+ * Report the facts that determine whether SIMD/multithreaded WASM is actually
+ * active, since neither is directly observable from the InferenceSession itself.
+ * @returns {Object} crossOriginIsolated, hardwareConcurrency, requestedThreads,
+ *                    and simdLikelySupported (WebAssembly SIMD feature-detect).
+ */
+async function getWasmRuntimeInfo() {
+    let simdLikelySupported = false;
+    try {
+        // Minimal valid WASM module containing a v128.const SIMD instruction.
+        // WebAssembly.validate returns false if the engine can't parse SIMD opcodes.
+        const simdTestBytes = Uint8Array.from([
+            0, 97, 115, 109, 1, 0, 0, 0, 1, 5, 1, 96, 0, 1, 123, 3, 2, 1, 0,
+            10, 10, 1, 8, 0, 65, 0, 253, 15, 253, 98, 11
+        ]);
+        simdLikelySupported = WebAssembly.validate(simdTestBytes);
+    } catch (e) {
+        simdLikelySupported = false;
+    }
+
+    return {
+        crossOriginIsolated: typeof crossOriginIsolated !== 'undefined' ? crossOriginIsolated : null,
+        hardwareConcurrency: navigator.hardwareConcurrency || null,
+        requestedThreads: ort.env.wasm.numThreads,
+        simdLikelySupported
+    };
+}
+
+// Note: with `ort.env.wasm.proxy = true`, ORT fetches/compiles the .wasm binary inside a
+// dedicated Worker, which has its own isolated Performance timeline - the main document's
+// `performance.getEntriesByType('resource')` never sees that request, so per-binary load
+// timing isn't observable from here. `perf.sessionCreation` below already spans the full
+// round trip (fetch + compile + thread-pool init inside the worker) and is the reliable figure.
 
 /**
  * Load an image from a URL and return it as an HTMLImageElement.
@@ -145,27 +183,25 @@ async function startSession(modelPath, provider) {
 }
 
 /**
- * Draw the original image and keypoints on the canvas from the model's heatmap output.
- * @param {HTMLCanvasElement} canvas Canvas to draw on.
- * @param {HTMLImageElement} image Original image (used for size/background).
+ * Decode the model's heatmap tensor into full-resolution corner coordinates.
+ * Pure computation, no canvas access - this "depth to space" unfold + threshold is the
+ * actual corner-localization step, kept separate from rendering so its cost (the thing
+ * people mean by "corner detection time") can be measured on its own, apart from the
+ * neural net's forward pass (see `runSession`/`perf.inference`) and canvas drawing.
  * @param {ort.Tensor} heatmapTensor Output 'semi' tensor from the model. Expect dims [1, C, H, W].
- * @notes Performs an implicit "depth-to-space" arrangement: assumes the first 64 channels map
- *        to an 8x8 sub-pixel grid per heatmap cell.
+ * @param {number} imageWidth Full-resolution image width.
+ * @param {number} imageHeight Full-resolution image height.
+ * @param {number} [confidenceThreshold=0.015] Minimum score to keep a point. Crucial parameter to tune.
+ * @returns {Array<{x: number, y: number, score: number}>} Detected corner points.
  */
-function drawKeypoints(canvas, image, heatmapTensor) {
-    const ctx = canvas.getContext('2d');
-    canvas.width = image.width;
-    canvas.height = image.height;
-    ctx.drawImage(image, 0, 0);
-
+function extractKeypoints(heatmapTensor, imageWidth, imageHeight, confidenceThreshold = 0.015) {
     const data = heatmapTensor.data;
     const dims = heatmapTensor.dims;
     const [channelCount, heatmapHeight, heatmapWidth] = [dims[1], dims[2], dims[3]];
-    const confidenceThreshold = 0.015; // This is a crucial parameter to tune.
 
     // The model outputs a heatmap with 65 channels. The first 64 are for keypoints in an 8x8 grid.
     // We need to perform a "depth to space" operation to create a full-size heatmap.
-    const fullSizeHeatmap = new Float32Array(image.width * image.height);
+    const fullSizeHeatmap = new Float32Array(imageWidth * imageHeight);
     const cellSize = 8;
 
     for (let c = 0; c < channelCount - 1; c++) { // Iterate through the 64 keypoint channels
@@ -180,22 +216,39 @@ function drawKeypoints(canvas, image, heatmapTensor) {
                 const finalX = x * cellSize + subPixelX;
                 const finalY = y * cellSize + subPixelY;
 
-                const fullMapIndex = finalY * image.width + finalX;
+                const fullMapIndex = finalY * imageWidth + finalX;
                 fullSizeHeatmap[fullMapIndex] = score;
             }
         }
     }
 
-    // Now, iterate through the full-size heatmap and draw points above the threshold.
-    ctx.fillStyle = 'green';
+    const keypoints = [];
     for (let i = 0; i < fullSizeHeatmap.length; i++) {
-        if (fullSizeHeatmap[i] > confidenceThreshold) {
-            const x = i % image.width;
-            const y = Math.floor(i / image.width);
-            ctx.beginPath();
-            ctx.arc(x, y, 2, 0, 2 * Math.PI); // Draw a circle of radius 2
-            ctx.fill();
+        const score = fullSizeHeatmap[i];
+        if (score > confidenceThreshold) {
+            keypoints.push({ x: i % imageWidth, y: Math.floor(i / imageWidth), score });
         }
+    }
+    return keypoints;
+}
+
+/**
+ * Draw the original image and previously-extracted keypoints on the canvas.
+ * @param {HTMLCanvasElement} canvas Canvas to draw on.
+ * @param {HTMLImageElement} image Original image (used for size/background).
+ * @param {Array<{x: number, y: number}>} keypoints Points from `extractKeypoints`.
+ */
+function renderKeypoints(canvas, image, keypoints) {
+    const ctx = canvas.getContext('2d');
+    canvas.width = image.width;
+    canvas.height = image.height;
+    ctx.drawImage(image, 0, 0);
+
+    ctx.fillStyle = 'green';
+    for (const { x, y } of keypoints) {
+        ctx.beginPath();
+        ctx.arc(x, y, 2, 0, 2 * Math.PI); // Draw a circle of radius 2
+        ctx.fill();
     }
 }
 
@@ -224,7 +277,8 @@ a.download = filename;
  * @returns {Promise<void>} Promise that resolves when the main flow completes.
  * @throws {Error} Any errors are caught internally and saved into the performance JSON.
  * @notes Records timings (ms) for: session creation, image loading, grayscale conversion,
- *        tensor creation and inference. Timings are expressed in milliseconds.
+ *        tensor creation, inference (NN forward pass), and keypoint extraction (corner
+ *        localization from the heatmap). Timings are expressed in milliseconds.
  */
 async function main() {
     const resultsData = {};
@@ -233,6 +287,8 @@ async function main() {
 
     try {
         resultsData.systemInfo = await getSystemInfo();
+        resultsData.wasmRuntimeInfo = await getWasmRuntimeInfo();
+        console.log('WASM runtime info:', resultsData.wasmRuntimeInfo);
         resultsData.runContext = {
             model: modelPath.split('/').pop(),
             image: imageUrl.split('/').pop()
@@ -241,11 +297,11 @@ async function main() {
         const perf = resultsData.performance;
 
         let startTime = performance.now();
-        
+
         const session = await startSession(modelPath, 'wasm');
         perf.sessionCreation = performance.now() - startTime;
         console.log('ONNX session started successfully.', session);
-        
+
         startTime = performance.now();
         const image = await loadImageElement(imageUrl);
         perf.imageLoading = performance.now() - startTime;
@@ -268,14 +324,19 @@ async function main() {
         perf.inference = performance.now() - startTime;
         console.log('Inference results:', results);
 
-        perf.totalTime = Object.values(perf).reduce((a, b) => a + b, 0);
-
         const canvas = document.getElementById('output-canvas');
         // The model output is a map with 'semi' and 'desc'. 'semi' is the heatmap.
         const heatmapTensor = results['semi'];
-        
         console.log('Heatmap Tensor:', heatmapTensor);
-        drawKeypoints(canvas, image, heatmapTensor);
+
+        startTime = performance.now();
+        const keypoints = extractKeypoints(heatmapTensor, image.width, image.height);
+        perf.keypointExtraction = performance.now() - startTime;
+        console.log(`Detected ${keypoints.length} corners.`);
+
+        renderKeypoints(canvas, image, keypoints);
+
+        perf.totalTime = Object.values(perf).reduce((a, b) => a + b, 0);
 
         console.log('Results Data:', resultsData);
         downloadJson(resultsData, `performance_${new Date().toISOString()}.json`);

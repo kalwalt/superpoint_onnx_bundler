@@ -38,10 +38,26 @@ npm start
 
 This will open a new browser tab with the application running at `http://localhost:8080`.
 
+To preview the production build (`dist/`) instead, with the headers ONNX Runtime Web needs for multithreading:
+
+```bash
+npm run build
+npm run preview
+```
+
+This opens `http://localhost:5000`.
+
+## ⚡ SIMD & Multithreading
+
+*   **SIMD** is always active when the browser's WebAssembly engine supports it: `onnxruntime-web` ships a single `ort-wasm-simd-threaded.wasm` binary (no separate SIMD/non-SIMD builds), so there's nothing to toggle.
+*   **Multithreading** (`ort.env.wasm.numThreads` in `main.js`) only takes effect when the page is **cross-origin isolated**, which requires the response headers `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp`. Without them, ORT silently falls back to a single thread. `webpack-dev-server` sets these automatically (see `webpack.config.js`), and `npm run preview` (via `serve-dist.js`) replicates them for the production build - **whatever host serves `dist/` in production must set the same two headers**, or threading will silently degrade.
+*   Running the app writes a `performance_*.json` file (see `downloadJson` in `main.js`) containing `wasmRuntimeInfo` (`crossOriginIsolated`, `hardwareConcurrency`, `requestedThreads`, `simdLikelySupported`) and `performance.sessionCreation` (ms), useful for confirming SIMD/threads are actually active and for measuring session init cost. Per-binary WASM fetch timing isn't observable from the main document because `ort.env.wasm.proxy = true` loads the binary inside a Worker with its own isolated Performance timeline - `sessionCreation` is the reliable end-to-end figure instead.
+
 ## 📦 Project Structure
 
 *   `main.js`: The main entry point of the application. It handles loading the ONNX model, pre-processing the image data, and running the inference.
 *   `webpack.config.js`: The configuration file for Webpack. It defines how the application is bundled and sets up the development server.
+*   `serve-dist.js`: Minimal static server for previewing the production build with the COOP/COEP headers required for WASM multithreading.
 *   `index.html`: The main HTML file that loads the bundled JavaScript application.
 *   `package.json`: Lists the project's dependencies and defines the `npm` scripts.
 
