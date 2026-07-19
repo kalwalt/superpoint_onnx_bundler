@@ -253,6 +253,71 @@ function renderKeypoints(canvas, image, keypoints) {
 }
 
 
+// Above this, an uploaded image's early conv activations (before the network's own
+// 8x downsampling kicks in) scale with width * height * channels, and can exhaust
+// WASM's linear memory. Not a correctness issue like alignment - a resource limit.
+const MAX_UPLOAD_DIMENSION = 2048;
+
+/**
+ * Downscale an image if either dimension exceeds MAX_UPLOAD_DIMENSION, preserving
+ * aspect ratio. Returns the original image unchanged if it's already within bounds.
+ * @param {HTMLImageElement} image Source image.
+ * @returns {HTMLImageElement|HTMLCanvasElement} The original image, or a canvas holding
+ *          the downscaled copy.
+ */
+function capImageDimensions(image) {
+    if (image.width <= MAX_UPLOAD_DIMENSION && image.height <= MAX_UPLOAD_DIMENSION) {
+        return image;
+    }
+    const scale = MAX_UPLOAD_DIMENSION / Math.max(image.width, image.height);
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.round(image.width * scale);
+    canvas.height = Math.round(image.height * scale);
+    canvas.getContext('2d').drawImage(image, 0, 0, canvas.width, canvas.height);
+    return canvas;
+}
+
+/**
+ * Run the full detection pipeline against an already-loaded image and render it.
+ * Shared by the default-image run and the upload handler so both go through the
+ * exact same code path (downscale cap -> grayscale -> tensor -> inference ->
+ * corner extraction -> render).
+ * @param {ort.InferenceSession} session Ready ONNX InferenceSession.
+ * @param {HTMLImageElement} image Loaded image to process.
+ * @param {HTMLCanvasElement} canvas Canvas to render keypoints onto.
+ * @returns {Promise<Object>} { timings: {grayscaleConversion, tensorCreation, inference,
+ *          keypointExtraction}, keypointCount, imageSize }.
+ */
+async function processImage(session, image, canvas) {
+    const timings = {};
+    const source = capImageDimensions(image);
+    const imageData = imageToImageData(source);
+
+    let startTime = performance.now();
+    const grayData = rgb2gray(imageData);
+    timings.grayscaleConversion = performance.now() - startTime;
+
+    const dims = [1, 1, imageData.height, imageData.width];
+
+    startTime = performance.now();
+    const inputTensor = defineTensorInput(grayData, dims);
+    timings.tensorCreation = performance.now() - startTime;
+
+    startTime = performance.now();
+    const results = await runSession(session, inputTensor);
+    timings.inference = performance.now() - startTime;
+
+    const heatmapTensor = results['semi'];
+
+    startTime = performance.now();
+    const keypoints = extractKeypoints(heatmapTensor, source.width, source.height);
+    timings.keypointExtraction = performance.now() - startTime;
+
+    renderKeypoints(canvas, source, keypoints);
+
+    return { timings, keypointCount: keypoints.length, imageSize: `${source.width}x${source.height}` };
+}
+
 /**
  * Trigger download of the provided data as a JSON file.
  * @param {Object} data Object to serialize as JSON.
@@ -273,6 +338,47 @@ a.download = filename;
 }
 
 /**
+ * Wire the file input so users can run detection on their own image, reusing the
+ * already-created session. Demonstrates that the canvas/pipeline size to whatever
+ * image is loaded - the bundled demo image just happens to be square.
+ * @param {ort.InferenceSession} session Ready ONNX InferenceSession.
+ * @param {HTMLCanvasElement} canvas Canvas to render keypoints onto.
+ * @returns {void}
+ */
+function setupImageUpload(session, canvas) {
+    const uploadInput = document.getElementById('image-upload');
+    const statusEl = document.getElementById('status');
+    if (!uploadInput) return;
+
+    uploadInput.addEventListener('change', async (event) => {
+        const file = event.target.files[0];
+        if (!file) return;
+
+        uploadInput.disabled = true;
+        if (statusEl) statusEl.textContent = 'Processing...';
+
+        const objectUrl = URL.createObjectURL(file);
+        try {
+            const image = await loadImageElement(objectUrl);
+            const { timings, keypointCount, imageSize } = await processImage(session, image, canvas);
+            console.log(`Detected ${keypointCount} corners in uploaded image.`, timings);
+            if (statusEl) {
+                statusEl.textContent = `Uploaded image (${imageSize}): ${keypointCount} corners detected ` +
+                    `(inference ${timings.inference.toFixed(1)} ms, extraction ${timings.keypointExtraction.toFixed(1)} ms).`;
+            }
+        } catch (e) {
+            console.error('Error processing uploaded image:', e);
+            if (statusEl) statusEl.textContent = `Error: ${e.message}`;
+        } finally {
+            URL.revokeObjectURL(objectUrl);
+            uploadInput.disabled = false;
+        }
+    });
+
+    uploadInput.disabled = false;
+}
+
+/**
  * Main entry point of the application.
  * @returns {Promise<void>} Promise that resolves when the main flow completes.
  * @throws {Error} Any errors are caught internally and saved into the performance JSON.
@@ -283,7 +389,9 @@ a.download = filename;
 async function main() {
     const resultsData = {};
     const modelPath = './data/superpoint_quantized.onnx';
-    const imageUrl = 'data/pinball_1024x1024.jpg';
+    const imageUrl = 'data/pinball.jpg';
+    const canvas = document.getElementById('output-canvas');
+    const statusEl = document.getElementById('status');
 
     try {
         resultsData.systemInfo = await getSystemInfo();
@@ -307,44 +415,23 @@ async function main() {
         perf.imageLoading = performance.now() - startTime;
         console.log('Image loaded successfully.', image);
 
-        const imageData = imageToImageData(image);
-
-        startTime = performance.now();
-        const grayData = rgb2gray(imageData);
-        perf.grayscaleConversion = performance.now() - startTime;
-
-        const dims = [1, 1, imageData.height, imageData.width];
-        
-        startTime = performance.now();
-        const inputTensor = defineTensorInput(grayData, dims);
-        perf.tensorCreation = performance.now() - startTime;
-        
-        startTime = performance.now();
-        const results = await runSession(session, inputTensor);
-        perf.inference = performance.now() - startTime;
-        console.log('Inference results:', results);
-
-        const canvas = document.getElementById('output-canvas');
-        // The model output is a map with 'semi' and 'desc'. 'semi' is the heatmap.
-        const heatmapTensor = results['semi'];
-        console.log('Heatmap Tensor:', heatmapTensor);
-
-        startTime = performance.now();
-        const keypoints = extractKeypoints(heatmapTensor, image.width, image.height);
-        perf.keypointExtraction = performance.now() - startTime;
-        console.log(`Detected ${keypoints.length} corners.`);
-
-        renderKeypoints(canvas, image, keypoints);
-
+        const { timings, keypointCount, imageSize } = await processImage(session, image, canvas);
+        Object.assign(perf, timings);
         perf.totalTime = Object.values(perf).reduce((a, b) => a + b, 0);
+        resultsData.keypointCount = keypointCount;
+        console.log(`Detected ${keypointCount} corners.`);
 
         console.log('Results Data:', resultsData);
         downloadJson(resultsData, `performance_${new Date().toISOString()}.json`);
-        
+
+        if (statusEl) statusEl.textContent = `Default image (${imageSize}): ${keypointCount} corners detected.`;
+        setupImageUpload(session, canvas);
+
     } catch (e) {
         console.error(`An error occurred in the main function: ${e}`);
         resultsData.error = e.message;
         downloadJson(resultsData, `performance_error_${new Date().toISOString()}.json`);
+        if (statusEl) statusEl.textContent = `Error: ${e.message}`;
     }
 }
 
