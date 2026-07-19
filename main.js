@@ -253,10 +253,35 @@ function renderKeypoints(canvas, image, keypoints) {
 }
 
 
+// Above this, an uploaded image's early conv activations (before the network's own
+// 8x downsampling kicks in) scale with width * height * channels, and can exhaust
+// WASM's linear memory. Not a correctness issue like alignment - a resource limit.
+const MAX_UPLOAD_DIMENSION = 2048;
+
+/**
+ * Downscale an image if either dimension exceeds MAX_UPLOAD_DIMENSION, preserving
+ * aspect ratio. Returns the original image unchanged if it's already within bounds.
+ * @param {HTMLImageElement} image Source image.
+ * @returns {HTMLImageElement|HTMLCanvasElement} The original image, or a canvas holding
+ *          the downscaled copy.
+ */
+function capImageDimensions(image) {
+    if (image.width <= MAX_UPLOAD_DIMENSION && image.height <= MAX_UPLOAD_DIMENSION) {
+        return image;
+    }
+    const scale = MAX_UPLOAD_DIMENSION / Math.max(image.width, image.height);
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.round(image.width * scale);
+    canvas.height = Math.round(image.height * scale);
+    canvas.getContext('2d').drawImage(image, 0, 0, canvas.width, canvas.height);
+    return canvas;
+}
+
 /**
  * Run the full detection pipeline against an already-loaded image and render it.
  * Shared by the default-image run and the upload handler so both go through the
- * exact same code path (grayscale -> tensor -> inference -> corner extraction -> render).
+ * exact same code path (downscale cap -> grayscale -> tensor -> inference ->
+ * corner extraction -> render).
  * @param {ort.InferenceSession} session Ready ONNX InferenceSession.
  * @param {HTMLImageElement} image Loaded image to process.
  * @param {HTMLCanvasElement} canvas Canvas to render keypoints onto.
@@ -265,7 +290,8 @@ function renderKeypoints(canvas, image, keypoints) {
  */
 async function processImage(session, image, canvas) {
     const timings = {};
-    const imageData = imageToImageData(image);
+    const source = capImageDimensions(image);
+    const imageData = imageToImageData(source);
 
     let startTime = performance.now();
     const grayData = rgb2gray(imageData);
@@ -284,12 +310,12 @@ async function processImage(session, image, canvas) {
     const heatmapTensor = results['semi'];
 
     startTime = performance.now();
-    const keypoints = extractKeypoints(heatmapTensor, image.width, image.height);
+    const keypoints = extractKeypoints(heatmapTensor, source.width, source.height);
     timings.keypointExtraction = performance.now() - startTime;
 
-    renderKeypoints(canvas, image, keypoints);
+    renderKeypoints(canvas, source, keypoints);
 
-    return { timings, keypointCount: keypoints.length, imageSize: `${image.width}x${image.height}` };
+    return { timings, keypointCount: keypoints.length, imageSize: `${source.width}x${source.height}` };
 }
 
 /**
